@@ -1,0 +1,9 @@
+/libtccd_inject.dylib
+/tccd_control_helper
+/.build-*
+/.build/
+/.build.json
+
+__pycache__/
+*.pyc
+.DS_Store
