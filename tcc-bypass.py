@@ -181,7 +181,7 @@ def bootstrap():
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
         print(
-            'usage: tcc-bypass.py build [--force] | start [minutes] | stop | status | logs [--snapshot]'
+            'usage: tcc-bypass.py build [--force] | start [minutes] | stop | status | logs [--snapshot] [--all]'
         )
         return 0
 

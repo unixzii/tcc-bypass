@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 static BOOL gJSONOutput;
+static BOOL gAllLogs;
 
 static NSDictionary *dictionary(id value) {
     return [value isKindOfClass:NSDictionary.class] ? value : @{};
@@ -216,11 +217,17 @@ static void printJSON(id value) {
 }
 
 static void printReply(NSDictionary *reply, TCOperation operation, BOOL snapshot) {
+    NSString *type = text(reply[@"type"]);
+    if (!gAllLogs && [type isEqualToString:@"record"]) {
+        NSDictionary *responsible = dictionary(dictionary(reply[@"record"])[@"responsible"]);
+        if ([text(responsible[@"identifier"]) hasPrefix:@"com.apple."])
+            return;
+    }
+
     if (gJSONOutput) {
         printJSON(reply);
         return;
     }
-    NSString *type = text(reply[@"type"]);
     if ([type isEqualToString:@"record"]) {
         printRecord(reply);
     } else if ([type isEqualToString:@"replay_begin"]) {
@@ -347,6 +354,7 @@ static int exchange(TCOperation operation, NSDictionary *value, BOOL snapshot) {
 int TCControlCLI(int argc, const char **argv) {
     // Bootstrap uses JSON; interactive commands default to readable text.
     gJSONOutput = argc >= 2 && strcmp(argv[1], "_attach") == 0;
+    gAllLogs = NO;
     if (argc >= 3 && strcmp(argv[argc - 1], "--json") == 0) {
         gJSONOutput = YES;
         argc--;
@@ -355,7 +363,7 @@ int TCControlCLI(int argc, const char **argv) {
     if (argc < 2) {
         fprintf(
             stderr,
-            "usage: tccd_control_helper enable [minutes] | disable | status | logs [--snapshot] [--json]\n");
+            "usage: tccd_control_helper enable [minutes] | disable | status | logs [--snapshot] [--all] [--json]\n");
         return 64;
     }
 
@@ -374,9 +382,20 @@ int TCControlCLI(int argc, const char **argv) {
     if (strcmp(argv[1], "status") == 0 && argc == 2)
         return exchange(TCStatus, @{}, NO);
 
-    if (strcmp(argv[1], "logs") == 0 &&
-        (argc == 2 || (argc == 3 && strcmp(argv[2], "--snapshot") == 0)))
-        return exchange(TCSubscribe, @{@"snapshot": @(argc == 3)}, argc == 3);
+    if (strcmp(argv[1], "logs") == 0) {
+        BOOL snapshot = NO;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--snapshot") == 0)
+                snapshot = YES;
+            else if (strcmp(argv[i], "--all") == 0)
+                gAllLogs = YES;
+            else if (strcmp(argv[i], "--json") == 0)
+                gJSONOutput = YES;
+            else
+                return clientError(@"invalid_command", 64);
+        }
+        return exchange(TCSubscribe, @{@"snapshot": @(snapshot)}, snapshot);
+    }
 
     if (strcmp(argv[1], "_attach") == 0 && argc == 3) {
         NSData *data = [@(argv[2]) dataUsingEncoding:NSUTF8StringEncoding];
