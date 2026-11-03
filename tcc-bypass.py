@@ -145,7 +145,7 @@ else:
 def bootstrap():
     # Reuse a healthy resident helper. Native status already performs a fresh
     # round trip to every tccd and detects new/unattached instances.
-    current = subprocess.run([str(HELPER), 'status'], text=True, capture_output=True)
+    current = subprocess.run([str(HELPER), 'status', '--json'], text=True, capture_output=True)
     if current.returncode == 0:
         value = json.loads(current.stdout)
         log(f'using helper pid {value["helper_pid"]}, connected {value["connected"]} tccd instances')

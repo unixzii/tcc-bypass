@@ -3,9 +3,208 @@
 #import "ControlHelper.h"
 #import "ControlProtocol.h"
 #include <errno.h>
+#include <math.h>
+#include <stdlib.h>
 #include <servers/bootstrap.h>
 #include <time.h>
 #include <unistd.h>
+
+static BOOL gJSONOutput;
+
+static NSDictionary *dictionary(id value) {
+    return [value isKindOfClass:NSDictionary.class] ? value : @{};
+}
+
+static NSString *text(id value) {
+    if (![value isKindOfClass:NSString.class] || ![value length])
+        return nil;
+    return [[value componentsSeparatedByCharactersInSet:NSCharacterSet.controlCharacterSet]
+        componentsJoinedByString:@"?"];
+}
+
+static NSNumber *number(id value) {
+    return [value isKindOfClass:NSNumber.class] ? value : nil;
+}
+
+static NSString *numericText(id value) {
+    return number(value).stringValue ?: @"?";
+}
+
+static NSString *paint(NSString *value, const char *color, FILE *stream) {
+    const char *term = getenv("TERM");
+    if (!isatty(fileno(stream)) || getenv("NO_COLOR") || (term && strcmp(term, "dumb") == 0))
+        return value;
+    return [NSString stringWithFormat:@"\033[%sm%@\033[0m", color, value];
+}
+
+static void printLine(FILE *stream, NSString *value) {
+    fprintf(stream, "%s\n", value.UTF8String);
+    fflush(stream);
+}
+
+static NSString *errorText(id value) {
+    return [text(value) stringByReplacingOccurrencesOfString:@"_" withString:@" "]
+               ?: @"unknown error";
+}
+
+static NSString *timestamp(id value) {
+    NSNumber *seconds = number(value);
+    if (!seconds || !isfinite(seconds.doubleValue) || seconds.doubleValue <= 0)
+        return @"unknown time";
+
+    static NSDateFormatter *formatter;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        formatter = [NSDateFormatter new];
+        formatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+        formatter.timeZone = NSTimeZone.localTimeZone;
+        formatter.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS Z";
+    });
+    return [formatter stringFromDate:[NSDate dateWithTimeIntervalSince1970:seconds.doubleValue]];
+}
+
+static NSString *processLabel(NSDictionary *process) {
+    NSString *identifier = text(process[@"identifier"]);
+    NSString *path = text(process[@"binary_path"]) ?: text(process[@"responsible_path"]);
+    NSString *name = identifier ?: path.lastPathComponent ?: @"unknown process";
+    return [NSString stringWithFormat:@"%@ (PID %@)", name, numericText(process[@"pid"])];
+}
+
+static NSString *permissionLabel(id value) {
+    NSString *service = text(value);
+    static NSDictionary *names;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        names = @{
+            @"kTCCServiceMicrophone": @"Microphone",
+            @"kTCCServiceCamera": @"Camera",
+            @"kTCCServiceScreenCapture": @"Screen Recording",
+            @"kTCCServiceAccessibility": @"Accessibility",
+            @"kTCCServiceListenEvent": @"Input Monitoring",
+            @"kTCCServicePostEvent": @"Post Events",
+            @"kTCCServiceAppleEvents": @"Automation",
+            @"kTCCServiceSystemPolicyAllFiles": @"Full Disk Access",
+            @"kTCCServiceSystemPolicyDesktopFolder": @"Desktop Folder",
+            @"kTCCServiceSystemPolicyDocumentsFolder": @"Documents Folder",
+            @"kTCCServiceSystemPolicyDownloadsFolder": @"Downloads Folder",
+            @"kTCCServiceAddressBook": @"Contacts",
+            @"kTCCServiceCalendar": @"Calendars",
+            @"kTCCServiceReminders": @"Reminders",
+            @"kTCCServicePhotos": @"Photos",
+            @"kTCCServiceLocation": @"Location"
+        };
+    });
+    NSString *name = names[service ?: @""];
+    return name ? [NSString stringWithFormat:@"%@ [%@]", name, service] : service ?: @"unknown permission";
+}
+
+static void printRecord(NSDictionary *reply) {
+    NSDictionary *record = dictionary(reply[@"record"]);
+    NSDictionary *accessing = dictionary(record[@"accessing"]);
+    NSDictionary *checked = dictionary(record[@"checked_process"]);
+    NSDictionary *actor = [number(accessing[@"available"]) boolValue] ? accessing : checked;
+    NSString *actorLabel = processLabel(actor);
+    NSNumber *original = number(record[@"original_entitlement_result"]);
+    NSString *action = original && !original.boolValue ? @"BYPASS" : @"CHECK";
+
+    printLine(
+        stdout,
+        [NSString stringWithFormat:@"%@  %@  %@ → %@",
+                                   paint(timestamp(record[@"timestamp"]), "2", stdout),
+                                   paint(action, original && !original.boolValue ? "1;32" : "1;33",
+                                         stdout),
+                                   paint(actorLabel, "1;36", stdout),
+                                   paint(permissionLabel(record[@"service"]), "1;35", stdout)]);
+
+    NSString *path = text(actor[@"binary_path"]);
+    if (path)
+        printLine(stdout, [NSString stringWithFormat:@"    binary: %@", path]);
+
+    for (NSString *role in @[@"requesting", @"responsible", @"checked_process"]) {
+        NSDictionary *process = dictionary(record[role]);
+        if (![number(process[@"available"]) boolValue] || [process isEqual:actor])
+            continue;
+        NSString *label = [role isEqualToString:@"checked_process"] ? @"checked" : role;
+        printLine(stdout, [NSString stringWithFormat:@"    %@: %@", label, processLabel(process)]);
+    }
+
+    NSMutableArray *details = [NSMutableArray new];
+    [details addObject:[NSString stringWithFormat:@"TCC allow entitlement: %@",
+                                                  original ? (original.boolValue
+                                                                  ? @"already present"
+                                                                  : @"supplied (originally absent)")
+                                                           : @"unknown"]];
+    [details addObject:[NSString stringWithFormat:@"tccd PID %@",
+                                                  numericText(record[@"tccd_pid"]
+                                                                  ?: reply[@"source_pid"])]];
+    if (text(record[@"request_id"]))
+        [details addObject:[NSString stringWithFormat:@"request %@", text(record[@"request_id"])]];
+    if ([number(record[@"preflight"]) boolValue])
+        [details addObject:@"preflight"];
+    printLine(stdout, [@"    " stringByAppendingString:[details componentsJoinedByString:@" · "]]);
+}
+
+static void printStatus(NSDictionary *reply, TCOperation operation) {
+    BOOL ok = [number(reply[@"ok"]) boolValue];
+    BOOL enabled = [number(reply[@"enabled"]) boolValue];
+    NSString *title =
+        ok ? (enabled ? @"Bypass enabled" : @"Bypass disabled") : @"Status incomplete";
+    if (!ok && operation == TCEnable)
+        title = @"Could not enable bypass on every tccd";
+    else if (!ok && operation == TCDisable)
+        title = @"Could not disable bypass on every tccd";
+
+    printLine(stdout, paint(title, !ok ? "1;31" : enabled ? "1;32" : "1;33", stdout));
+    if (number(reply[@"helper_pid"])) {
+        printLine(stdout,
+                  [NSString stringWithFormat:@"  Helper PID %@ · connected %@/%@ · acknowledged %@",
+                                             numericText(reply[@"helper_pid"]),
+                                             numericText(reply[@"connected"]),
+                                             numericText(reply[@"expected"]),
+                                             numericText(reply[@"acknowledged"])]);
+    }
+
+    for (NSDictionary *state in reply[@"results"]) {
+        BOOL active = [number(state[@"enabled"]) boolValue];
+        NSString *status = paint(active ? @"enabled" : @"disabled", active ? "32" : "33", stdout);
+        NSString *expiry =
+            active ? [NSString stringWithFormat:@" · expires %@", timestamp(state[@"expires_at"])]
+                   : @"";
+        printLine(stdout, [NSString stringWithFormat:@"  tccd PID %@ (UID %@) · %@%@",
+                                                     numericText(state[@"pid"]),
+                                                     numericText(state[@"uid"]), status, expiry]);
+        printLine(
+            stdout,
+            [NSString
+                stringWithFormat:@"    Logs: %@ generated · %@ sent · %@ dropped · %@ oversized",
+                                 numericText(state[@"logs_generated"]),
+                                 numericText(state[@"logs_sent"]),
+                                 numericText(state[@"logs_dropped"]),
+                                 numericText(state[@"logs_oversized"])]);
+    }
+
+    NSDictionary *ring = dictionary(reply[@"ring"]);
+    if (ring.count) {
+        printLine(
+            stdout,
+            [NSString
+                stringWithFormat:@"  Log buffer: %@ records · %@ bytes · %@ evicted · %@ oversized",
+                                 numericText(ring[@"records"]), numericText(ring[@"bytes"]),
+                                 numericText(ring[@"evicted"]), numericText(ring[@"oversized"])]);
+    }
+    if (reply[@"error"])
+        printLine(stderr, paint([@"Error: " stringByAppendingString:errorText(reply[@"error"])],
+                                "31", stderr));
+    for (NSDictionary *error in reply[@"errors"])
+        printLine(stderr,
+                  paint([NSString stringWithFormat:@"  tccd PID %@: %@", numericText(error[@"pid"]),
+                                                   errorText(error[@"error"])],
+                        "31", stderr));
+    for (id pid in reply[@"missing_pids"])
+        printLine(stderr, paint([NSString stringWithFormat:@"  tccd PID %@: not connected",
+                                                           numericText(pid)],
+                                "31", stderr));
+}
 
 static void printJSON(id value) {
     NSData *data = TCEncode(value);
@@ -16,8 +215,51 @@ static void printJSON(id value) {
     }
 }
 
+static void printReply(NSDictionary *reply, TCOperation operation, BOOL snapshot) {
+    if (gJSONOutput) {
+        printJSON(reply);
+        return;
+    }
+    NSString *type = text(reply[@"type"]);
+    if ([type isEqualToString:@"record"]) {
+        printRecord(reply);
+    } else if ([type isEqualToString:@"replay_begin"]) {
+        NSDictionary *ring = dictionary(reply[@"ring"]);
+        printLine(
+            stdout,
+            paint(
+                [NSString
+                    stringWithFormat:@"Replaying logs · %@ buffered · %@ evicted · times are local",
+                                     numericText(ring[@"records"]), numericText(ring[@"evicted"])],
+                "2", stdout));
+    } else if ([type isEqualToString:@"replay_end"]) {
+        printLine(stdout, paint(snapshot ? @"End of snapshot"
+                                         : @"Following live permission checks… (Ctrl-C to stop)",
+                                "2", stdout));
+    } else if ([type isEqualToString:@"gap"]) {
+        printLine(
+            stdout,
+            paint([NSString stringWithFormat:@"Log gap: records %@–%@ unavailable (%@)",
+                                             numericText(reply[@"from"]), numericText(reply[@"to"]),
+                                             errorText(reply[@"reason"])],
+                  "33", stdout));
+    } else if ([type isEqualToString:@"end"]) {
+        FILE *stream = reply[@"error"] ? stderr : stdout;
+        printLine(stream,
+                  paint([NSString stringWithFormat:@"Log stream ended: %@",
+                                                   errorText(reply[@"error"] ?: reply[@"reason"])],
+                        reply[@"error"] ? "31" : "33", stream));
+    } else {
+        printStatus(reply, operation);
+    }
+}
+
 static int clientError(NSString *error, int code) {
-    printJSON(@{@"ok": @NO, @"error": error});
+    if (gJSONOutput)
+        printJSON(@{@"ok": @NO, @"error": error});
+    else
+        printLine(stderr,
+                  paint([@"Error: " stringByAppendingString:errorText(error)], "1;31", stderr));
     return code;
 }
 
@@ -83,8 +325,7 @@ static int exchange(TCOperation operation, NSDictionary *value, BOOL snapshot) {
                 break;
             }
 
-            // Preserve original record casing and paths. Only human diagnostics are lowercase.
-            printJSON(reply);
+            printReply(reply, operation, snapshot);
             if (!streaming) {
                 exitCode = [reply[@"ok"] boolValue] ? 0 : 1;
                 break;
@@ -104,10 +345,17 @@ static int exchange(TCOperation operation, NSDictionary *value, BOOL snapshot) {
 }
 
 int TCControlCLI(int argc, const char **argv) {
+    // Bootstrap uses JSON; interactive commands default to readable text.
+    gJSONOutput = argc >= 2 && strcmp(argv[1], "_attach") == 0;
+    if (argc >= 3 && strcmp(argv[argc - 1], "--json") == 0) {
+        gJSONOutput = YES;
+        argc--;
+    }
+
     if (argc < 2) {
         fprintf(
             stderr,
-            "usage: tccd_control_helper enable [minutes] | disable | status | logs [--snapshot]\n");
+            "usage: tccd_control_helper enable [minutes] | disable | status | logs [--snapshot] [--json]\n");
         return 64;
     }
 
